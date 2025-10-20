@@ -2,6 +2,10 @@ import streamlit as st
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
 import os
 import tempfile
 
@@ -30,12 +34,12 @@ if 'current_mode' not in st.session_state:
     st.session_state.current_mode = "Brainy Buddy"
 if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
-if 'rag_chain' not in st.session_state:
-    st.session_state.rag_chain = None
 if 'processed_files' not in st.session_state:
     st.session_state.processed_files = []
 if 'demo_mode' not in st.session_state:
     st.session_state.demo_mode = not bool(groq_api_key)
+if 'document_chat_history' not in st.session_state:
+    st.session_state.document_chat_history = []
 
 with st.sidebar:
     st.title("🤖 OmniBot Settings")
@@ -82,8 +86,8 @@ with st.sidebar:
         if st.button("Clear Docs", use_container_width=True):
             st.session_state.document_store = {}
             st.session_state.vectorstore = None
-            st.session_state.rag_chain = None
             st.session_state.processed_files = []
+            st.session_state.document_chat_history = []
             st.rerun()
 
 st.title("🤖 OmniBot - Your Intelligent AI Companion")
@@ -146,6 +150,87 @@ def get_llm():
     else:
         return None
 
+def process_documents(uploaded_files):
+    documents = []
+    temp_files = []
+    
+    try:
+        for uploaded_file in uploaded_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(uploaded_file.getbuffer())
+                temp_files.append(temp_file.name)
+            
+            loader = PyPDFLoader(temp_file.name)
+            docs = loader.load()
+            for doc in docs:
+                doc.metadata['source'] = uploaded_file.name
+            documents.extend(docs)
+        
+        if documents:
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            splits = text_splitter.split_documents(documents)
+            
+            embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+            
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
+            
+            return vectorstore, splits
+        return None, []
+    
+    except Exception as e:
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+        raise e
+
+def get_document_answer(question, vectorstore, chat_history):
+    llm = get_llm()
+    if not llm:
+        return "API key not configured"
+    
+    try:
+        # Search for relevant documents
+        docs = vectorstore.similarity_search(question, k=3)
+        context = "\n\n".join([doc.page_content for doc in docs])
+        
+        # Build conversation history
+        history_text = ""
+        for i, msg in enumerate(chat_history[-4:]):  # Last 4 messages for context
+            role = "Human" if msg["role"] == "user" else "Assistant"
+            history_text += f"{role}: {msg['content']}\n"
+        
+        # Create prompt with context and history
+        prompt_text = f"""You are DocuMind, an expert at analyzing documents. Use the provided context to answer the question.
+
+Context from documents:
+{context}
+
+Conversation history:
+{history_text}
+
+Question: {question}
+
+Provide a clear, accurate answer based only on the context. If the answer isn't in the context, say so."""
+        
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful assistant that answers questions based on provided documents."),
+            ("human", "{question}"),
+        ])
+        
+        chain = prompt_template | llm | StrOutputParser()
+        response = chain.invoke({"question": prompt_text})
+        return response
+        
+    except Exception as e:
+        return f"Error processing document question: {str(e)}"
+
 if st.session_state.current_mode == "Brainy Buddy":
     st.header("💬 Brainy Buddy - Intelligent Conversations")
     
@@ -189,17 +274,33 @@ elif st.session_state.current_mode == "DocuMind":
     
     if st.session_state.demo_mode:
         st.info("🔶 Demo Mode - Add GROQ_API_KEY to process documents")
-        st.markdown("Document processing requires Groq API key for full functionality.")
+    else:
+        st.markdown("Upload PDF documents and ask questions about their content")
     
     uploaded_files = st.file_uploader("Upload PDF documents", type="pdf", accept_multiple_files=True)
     
-    if uploaded_files:
-        if st.session_state.demo_mode:
-            st.info(f"📁 {len(uploaded_files)} file(s) uploaded. Add API key to process them.")
-        else:
-            st.info(f"📁 {len(uploaded_files)} file(s) uploaded. Document processing requires additional setup.")
+    if uploaded_files and not st.session_state.demo_mode:
+        if st.session_state.processed_files:
+            st.info(f"📁 Processed files: {', '.join(st.session_state.processed_files)}")
+        
+        if st.session_state.vectorstore is None or st.button("Reprocess Documents"):
+            with st.spinner("📄 Processing documents... This may take a moment."):
+                try:
+                    vectorstore, splits = process_documents(uploaded_files)
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.processed_files = [f.name for f in uploaded_files]
+                    st.success(f"✅ Processed {len(uploaded_files)} document(s) with {len(splits)} chunks! You can now ask questions.")
+                except Exception as e:
+                    st.error(f"Error processing documents: {str(e)}")
     
-    user_question = st.text_input("Enter your question about documents:", key="doc_question")
+    # Display document chat history
+    if st.session_state.document_chat_history:
+        st.subheader("Document Conversation")
+        for message in st.session_state.document_chat_history:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+    
+    user_question = st.text_input("Enter your question about the documents:", key="doc_question")
     
     if user_question:
         if st.session_state.demo_mode:
@@ -209,12 +310,25 @@ elif st.session_state.current_mode == "DocuMind":
                 response = get_demo_response("DocuMind", user_question)
                 st.markdown(response)
         else:
-            st.info("Document Q&A feature requires additional dependencies. Running in demo mode.")
-            with st.chat_message("user"):
-                st.markdown(user_question)
-            with st.chat_message("assistant"):
-                response = get_demo_response("DocuMind", user_question)
-                st.markdown(response)
+            if st.session_state.vectorstore is None:
+                st.warning("Please upload and process documents first.")
+            else:
+                with st.spinner("🔍 Searching documents..."):
+                    # Add user question to chat history
+                    st.session_state.document_chat_history.append({"role": "user", "content": user_question})
+                    
+                    with st.chat_message("user"):
+                        st.markdown(user_question)
+                    
+                    with st.chat_message("assistant"):
+                        try:
+                            response = get_document_answer(user_question, st.session_state.vectorstore, st.session_state.document_chat_history)
+                            st.markdown(response)
+                            st.session_state.document_chat_history.append({"role": "assistant", "content": response})
+                        except Exception as e:
+                            error_msg = f"Error processing question: {str(e)}"
+                            st.error(error_msg)
+                            st.session_state.document_chat_history.append({"role": "assistant", "content": error_msg})
 
 elif st.session_state.current_mode == "CodeCraft":
     st.header("💻 CodeCraft - Your Coding Assistant")
