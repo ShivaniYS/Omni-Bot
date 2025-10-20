@@ -2,17 +2,6 @@ import streamlit as st
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains import create_retrieval_chain
-from langchain.chains.history_aware_retriever import create_history_aware_retriever
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_chroma import Chroma
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.prompts import MessagesPlaceholder
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.runnables.history import RunnableWithMessageHistory
 import os
 import tempfile
 
@@ -200,72 +189,17 @@ elif st.session_state.current_mode == "DocuMind":
     
     if st.session_state.demo_mode:
         st.info("🔶 Demo Mode - Add GROQ_API_KEY to process documents")
+        st.markdown("Document processing requires Groq API key for full functionality.")
     
     uploaded_files = st.file_uploader("Upload PDF documents", type="pdf", accept_multiple_files=True)
     
-    if uploaded_files and not st.session_state.demo_mode:
-        llm = get_llm()
-        if not llm:
-            st.error("❌ API key issue. Check GROQ_API_KEY in secrets.")
+    if uploaded_files:
+        if st.session_state.demo_mode:
+            st.info(f"📁 {len(uploaded_files)} file(s) uploaded. Add API key to process them.")
         else:
-            if st.session_state.processed_files:
-                st.info(f"📁 Processed files: {', '.join(st.session_state.processed_files)}")
-            
-            if st.session_state.vectorstore is None or st.button("Reprocess Documents"):
-                with st.spinner("📄 Processing documents..."):
-                    documents = []
-                    temp_files = []
-                    
-                    try:
-                        for uploaded_file in uploaded_files:
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                                temp_file.write(uploaded_file.getbuffer())
-                                temp_files.append(temp_file.name)
-                            loader = PyPDFLoader(temp_file.name)
-                            docs = loader.load()
-                            for doc in docs:
-                                doc.metadata['source'] = uploaded_file.name
-                            documents.extend(docs)
-                        
-                        if documents:
-                            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-                            splits = text_splitter.split_documents(documents)
-                            embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-                            vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-                            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-                            
-                            contextualize_q_prompt = ChatPromptTemplate.from_messages([
-                                ("system", "Reformulate the question to be standalone."),
-                                MessagesPlaceholder(variable_name="chat_history"),
-                                ("human", "{input}"),
-                            ])
-                            
-                            history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
-                            
-                            qa_prompt = ChatPromptTemplate.from_messages([
-                                ("system", "Use context to answer: {context}"),
-                                MessagesPlaceholder(variable_name="chat_history"),
-                                ("human", "{input}"),
-                            ])
-                            
-                            question_answering_chain = create_stuff_documents_chain(llm, qa_prompt)
-                            rag_chain = create_retrieval_chain(history_aware_retriever, question_answering_chain)
-                            
-                            st.session_state.vectorstore = vectorstore
-                            st.session_state.rag_chain = rag_chain
-                            st.session_state.processed_files = [f.name for f in uploaded_files]
-                            st.success(f"✅ Processed {len(uploaded_files)} document(s)!")
-                        
-                        for temp_file in temp_files:
-                            try:
-                                os.unlink(temp_file)
-                            except:
-                                pass
-                                
-                    except Exception as e:
-                        st.error(f"Error processing documents: {str(e)}")
+            st.info(f"📁 {len(uploaded_files)} file(s) uploaded. Document processing requires additional setup.")
     
-    user_question = st.text_input("Enter your question about the documents:", key="doc_question")
+    user_question = st.text_input("Enter your question about documents:", key="doc_question")
     
     if user_question:
         if st.session_state.demo_mode:
@@ -274,34 +208,13 @@ elif st.session_state.current_mode == "DocuMind":
             with st.chat_message("assistant"):
                 response = get_demo_response("DocuMind", user_question)
                 st.markdown(response)
-        elif st.session_state.rag_chain is not None:
-            with st.spinner("🔍 Searching documents..."):
-                try:
-                    def get_session_history(session_id: str) -> BaseChatMessageHistory:
-                        if session_id not in st.session_state.document_store:
-                            st.session_state.document_store[session_id] = ChatMessageHistory()
-                        return st.session_state.document_store[session_id]
-                    
-                    conversational_rag_chain = RunnableWithMessageHistory(
-                        st.session_state.rag_chain,
-                        get_session_history,
-                        input_messages_key="input",
-                        history_messages_key="chat_history",
-                        output_messages_key="answer",
-                    )
-                    
-                    response = conversational_rag_chain.invoke(
-                        {"input": user_question},
-                        config={"configurable": {"session_id": session_id}}
-                    )
-                    
-                    st.subheader("📝 Answer:")
-                    st.write(response['answer'])
-                    
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
         else:
-            st.warning("Upload and process documents first.")
+            st.info("Document Q&A feature requires additional dependencies. Running in demo mode.")
+            with st.chat_message("user"):
+                st.markdown(user_question)
+            with st.chat_message("assistant"):
+                response = get_demo_response("DocuMind", user_question)
+                st.markdown(response)
 
 elif st.session_state.current_mode == "CodeCraft":
     st.header("💻 CodeCraft - Your Coding Assistant")
@@ -324,7 +237,7 @@ elif st.session_state.current_mode == "CodeCraft":
                 st.markdown("**Response:**")
                 st.markdown(interaction['response'])
     
-    code_prompt = st.text_area("Describe your coding task or paste your code:", height=150)
+    code_prompt = st.text_area("Describe your coding task or paste your code:", height=150, placeholder="e.g., Write a Python function to calculate factorial...")
     
     if st.button("Get Code Help 🚀", type="primary"):
         if code_prompt:
